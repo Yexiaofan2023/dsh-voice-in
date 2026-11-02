@@ -1,0 +1,8 @@
+# dsh-voice-in：聊天输入框旁的语音输入
+# 装法见 README；这个 patch 只是把插件本身挂上，没有额外配置项。
+- insert:
+    - id: voice-in
+      name: dsh-voice-in
+      config:
+        port: 7788
+        silenceMs: 700

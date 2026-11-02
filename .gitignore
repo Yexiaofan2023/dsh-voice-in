@@ -1,0 +1,21 @@
+﻿# 运行产物
+*.log
+*.err
+svc-access.log
+tmp/
+service/tmp/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# 依赖
+node_modules/
+
+# 音频临时文件
+*.wav
+*.webm
+!ref-clean.wav
