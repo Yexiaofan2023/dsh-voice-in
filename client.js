@@ -518,7 +518,7 @@ window.__ModuleLoader__.load({
       }, [auto, stopPlayback, speakText])
 
       const active = state === 'rec'
-      return h('div', { style: { display: 'inline-flex', alignItems: 'center', gap: 6 } }, [
+      return h('div', { style: { display: 'inline-flex', alignItems: 'center', gap: 6, position: 'relative' } }, [
         h('button', {
           key: 'btn',
           type: 'button',
@@ -598,6 +598,100 @@ window.__ModuleLoader__.load({
           key: 'hint',
           style: { fontSize: 11, color: 'rgba(150,180,215,0.75)', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
         }, hint) : null,
+        h(Panel, { key: 'panel', service: SERVICE, speakText, stopPlayback, fillInput }),
+      ])
+    }
+
+    /** ⚙ 调试面板：状态、缺什么、音色、试听、配置位置 */
+    function Panel({ service, speakText, stopPlayback, fillInput }) {
+      const [open, setOpen] = React.useState(false)
+      const [info, setInfo] = React.useState(null)
+      const [err, setErr] = React.useState('')
+      const [busy, setBusy] = React.useState(false)
+      const [testText, setTestText] = React.useState('这是测试语音，听听效果怎么样。')
+
+      const load = React.useCallback(async () => {
+        setErr('')
+        try {
+          const r = await fetch(service + '/health', { cache: 'no-store' })
+          setInfo(await r.json())
+        } catch (e) {
+          setErr(String((e && e.message) || e))
+          setInfo(null)
+        }
+      }, [service])
+
+      React.useEffect(() => { if (open) load() }, [open, load])
+
+      const tryTts = async () => {
+        setBusy(true)
+        try { await speakText(testText) } finally { setBusy(false) }
+      }
+
+      const btn = (label, onClick, extra) =>
+        h('button', {
+          type: 'button',
+          onClick: (e) => { e.preventDefault(); e.stopPropagation(); onClick() },
+          style: {
+            padding: '3px 9px', fontSize: 11, borderRadius: 6, cursor: 'pointer',
+            border: '1px solid rgba(120,160,200,0.35)', background: 'rgba(120,160,200,0.08)',
+            color: 'rgba(160,190,225,0.9)', ...(extra || {}),
+          },
+        }, label)
+
+      if (!open) {
+        return h('button', {
+          key: 'gear',
+          type: 'button',
+          title: '语音插件状态与调试',
+          onClick: (e) => { e.preventDefault(); e.stopPropagation(); setOpen(true) },
+          style: {
+            display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+            width: 24, height: 24, borderRadius: 6, cursor: 'pointer',
+            border: '1px solid rgba(120,160,200,0.25)', background: 'transparent',
+            color: 'rgba(150,180,215,0.7)', fontSize: 12, padding: 0,
+          },
+        }, '⚙')
+      }
+
+      const row = (k, v) => h('div', { key: k, style: { display: 'flex', gap: 8, lineHeight: 1.7 } }, [
+        h('span', { key: 'k', style: { color: 'rgba(150,170,195,0.75)', minWidth: 62 } }, k),
+        h('span', { key: 'v', style: { color: 'rgba(210,225,245,0.95)', wordBreak: 'break-all' } }, v),
+      ])
+
+      return h('div', {
+        key: 'panel',
+        style: {
+          position: 'absolute', bottom: 34, left: 0, zIndex: 9999,
+          width: 340, padding: 12, borderRadius: 10,
+          background: 'rgba(24,30,42,0.98)', border: '1px solid rgba(120,160,200,0.28)',
+          boxShadow: '0 8px 28px rgba(0,0,0,0.45)', color: 'rgba(210,225,245,0.95)',
+          fontSize: 12, lineHeight: 1.6,
+        },
+      }, [
+        h('div', { key: 'head', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 } }, [
+          h('strong', { key: 't', style: { fontSize: 13 } }, '语音插件'),
+          h('span', { key: 'x', onClick: () => { stopPlayback(); setOpen(false) }, style: { cursor: 'pointer', opacity: 0.6 } }, '✕'),
+        ]),
+        err ? row('错误', err) : null,
+        info ? [
+          row('服务', info.sherpa && info.tts ? '✓ 就绪' : info.sherpa ? '识别就绪，播报未启动' : '✗ 未就绪'),
+          row('音色', info.voice || '（未配置）'),
+          row('可用音色', (info.voices || []).join(', ') || '（无）'),
+          Array.isArray(info.missing) && info.missing.length
+            ? h('div', { key: 'miss', style: { marginTop: 6, padding: 8, borderRadius: 6, background: 'rgba(255,150,80,0.12)', border: '1px solid rgba(255,150,80,0.3)' } }, [
+              h('div', { key: 'h', style: { marginBottom: 4, color: '#ffb87a' } }, '⚠ 缺依赖'),
+              ...info.missing.map((m, i) => h('div', { key: 'm' + i, style: { fontSize: 11, color: 'rgba(220,205,190,0.9)' } }, `· ${m.what} → ${m.how}`)),
+            ])
+            : row('依赖', Array.isArray(info.missing) ? '✓ 齐全' : '？（服务未返回状态）'),
+        ] : row('服务', '检查中…'),
+        h('div', { key: 'ops', style: { display: 'flex', gap: 6, marginTop: 10, flexWrap: 'wrap' } }, [
+          btn('刷新状态', load),
+          btn(busy ? '试听中…' : '试听音色', tryTts),
+          btn('重置播报状态', () => { stopPlayback(); load() }),
+        ]),
+        h('div', { key: 'hintrow', style: { marginTop: 8, fontSize: 11, color: 'rgba(140,160,185,0.7)' } },
+          '配置文件：~/.dsh/voice-in-config.json'),
       ])
     }
 
