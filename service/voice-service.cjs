@@ -1,6 +1,10 @@
 /**
- * 语音服务原型：ASR（SenseVoice）+ TTS（F5-TTS 第 8 轮音色）
- * 先用独立 HTTP 服务验证接口，通了再包成 DSH 插件
+ * dsh-voice-in 本地语音服务：ASR（SenseVoice）+ TTS（F5-TTS）
+ *
+ * 所有路径都从配置读，优先级：
+ *   环境变量 > ~/.dsh/voice-in-config.json > 插件目录下的 config.json > 默认值
+ *
+ * 配置见 README。
  */
 const http = require('http')
 const fs = require('fs')
@@ -9,19 +13,122 @@ const os = require('os')
 const { spawn } = require('child_process')
 
 const HOME = os.homedir()
-const SHERPA = path.join(HOME, '.dsh', 'profiles', 'desktop', 'node_modules', 'dsh-orb', 'node_modules', 'sherpa-onnx-node')
-const ASR_ROOT = path.join(HOME, '.dsh', 'speech-to-text', 'sensevoice', 'models')
-const PY = 'D:\\实用软件\\tts-venv\\Scripts\\python.exe'
+const HOME_DSH = path.join(HOME, '.dsh')
 const F5_SCRIPT = path.join(__dirname, 'f5_server.py')
-const FFMPEG = path.join(HOME, '.dsh', 'bin', 'ffmpeg.exe')
 const TMP = path.join(__dirname, 'tmp')
-
 fs.mkdirSync(TMP, { recursive: true })
+
+// ---------- 配置 ----------
+function expand(p) {
+  if (!p) return p
+  return p
+    .replace(/^~(?=$|[\\/])/, HOME)
+    .replace(/%([^%]+)%/g, (_, k) => process.env[k] || '')
+    .replace(/\$([A-Z_][A-Z0-9_]*)/gi, (_, k) => process.env[k] || '')
+}
+
+function readJsonSafe(p) {
+  try {
+    return JSON.parse(fs.readFileSync(p, 'utf8').replace(/^\uFEFF/, ''))
+  } catch {
+    return {}
+  }
+}
+
+const userCfg = readJsonSafe(path.join(HOME_DSH, 'voice-in-config.json'))
+const localCfg = readJsonSafe(path.join(__dirname, '..', 'config.json'))
+const cfg = { ...localCfg, ...userCfg }
+
+const env = process.env
+
+/** sherpa-onnx-node 的加载路径：优先配置，其次正常 require */
+function resolveSherpa() {
+  const configured = expand(env.VOICE_SHERPA_PATH || cfg.sherpaPath)
+  if (configured && fs.existsSync(configured)) return configured
+  // 正常装法：作为本包的依赖
+  try {
+    return require.resolve('sherpa-onnx-node')
+  } catch {}
+  // 兜底：借用其他插件自带的
+  const fallback = path.join(HOME_DSH, 'profiles', 'desktop', 'node_modules', 'dsh-orb', 'node_modules', 'sherpa-onnx-node')
+  if (fs.existsSync(fallback)) return fallback
+  return null
+}
+
+const SHERPA = resolveSherpa()
+const ASR_ROOT = expand(env.VOICE_ASR_MODELS || cfg.asrModelsRoot) ||
+  path.join(HOME_DSH, 'speech-to-text', 'sensevoice', 'models')
+const PY = expand(env.VOICE_TTS_PYTHON || cfg.ttsPython) || 'python'
+const FFMPEG = expand(env.VOICE_FFMPEG || cfg.ffmpeg) ||
+  (process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
+
+/** TTS 音色配置：可以给多个，客户端用 key 选 */
+const TTS_VOICES = (() => {
+  const fromCfg = cfg.ttsVoices || cfg['tts_voices']
+  if (fromCfg && typeof fromCfg === 'object') {
+    const out = {}
+    for (const [k, v] of Object.entries(fromCfg)) {
+      if (!v || !v.ckpt) continue
+      out[k] = {
+        ckpt: expand(v.ckpt),
+        ref: expand(v.ref),
+        refText: v.refText || '',
+        speed: v.speed || cfg.ttsSpeed || 0.85,
+        label: v.label || k,
+      }
+    }
+    return out
+  }
+  // 兼容老的单音色配置
+  const ckpt = expand(env.VOICE_TTS_CKPT || cfg.ttsCkpt)
+  const ref = expand(env.VOICE_TTS_REF || cfg.ttsRef)
+  if (ckpt && ref) {
+    return { default: { ckpt, ref, refText: cfg.ttsRefText || '', speed: cfg.ttsSpeed || 0.85, label: 'default' } }
+  }
+  return {}
+})()
+
+const DEFAULT_VOICE = cfg.ttsDefaultVoice || Object.keys(TTS_VOICES)[0] || null
+
+/** 自检：缺什么列什么，别到用的时候才炸 */
+function selfCheck() {
+  const missing = []
+  if (!SHERPA) missing.push({ what: 'sherpa-onnx-node', how: '在插件目录跑 pnpm add sherpa-onnx-node' })
+  else if (!fs.existsSync(SHERPA)) missing.push({ what: 'sherpa-onnx-node', how: '配置里的 sherpaPath 不存在' })
+
+  const senseModel = path.join(ASR_ROOT, 'sensevoice-onnx', 'model.int8.onnx')
+  const tokens = path.join(ASR_ROOT, 'sensevoice-onnx', 'tokens.txt')
+  if (!fs.existsSync(senseModel)) missing.push({ what: 'ASR 模型 model.int8.onnx', how: `放到 ${ASR_ROOT}\\sensevoice-onnx\\` })
+  if (!fs.existsSync(tokens)) missing.push({ what: 'ASR tokens.txt', how: `放到 ${ASR_ROOT}\\sensevoice-onnx\\` })
+
+  if (!whichFfmpeg()) missing.push({ what: 'ffmpeg', how: '装到 PATH，或在配置里写 ffmpeg 的绝对路径' })
+  if (!DEFAULT_VOICE) missing.push({ what: 'TTS 音色', how: '在配置的 ttsVoices 里配一个 ckpt + ref' })
+  else {
+    const v = TTS_VOICES[DEFAULT_VOICE]
+    if (!fs.existsSync(v.ckpt)) missing.push({ what: `音色 ${DEFAULT_VOICE} 的 ckpt`, how: v.ckpt })
+    if (v.ref && !fs.existsSync(v.ref)) missing.push({ what: `音色 ${DEFAULT_VOICE} 的参考音频`, how: v.ref })
+  }
+  return missing
+}
+
+function whichFfmpeg() {
+  if (path.isAbsolute(FFMPEG)) return fs.existsSync(FFMPEG) ? FFMPEG : null
+  const dirs = (process.env.PATH || '').split(path.delimiter)
+  const names = process.platform === 'win32' ? [FFMPEG, 'ffmpeg.exe'] : [FFMPEG]
+  for (const d of dirs) {
+    for (const n of names) {
+      const p = path.join(d, n)
+      if (fs.existsSync(p)) return p
+    }
+  }
+  return null
+}
 
 // ---------- ASR ----------
 let recognizer = null
 function getRecognizer() {
   if (recognizer) return recognizer
+  if (!SHERPA) throw new Error('找不到 sherpa-onnx-node。在插件目录运行：pnpm add sherpa-onnx-node')
   const sherpa = require(SHERPA)
   recognizer = new sherpa.OfflineRecognizer({
     featConfig: { sampleRate: 16000, featureDim: 80 },
@@ -40,6 +147,18 @@ function getRecognizer() {
   return recognizer
 }
 
+// ---------- ffmpeg 转 16k 单声道 ----------
+function toWav16k(inPath, outPath) {
+  return new Promise((resolve, reject) => {
+    const exe = whichFfmpeg() || FFMPEG
+    const p = spawn(exe, ['-y', '-i', inPath, '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', outPath])
+    let err = ''
+    p.stderr.on('data', (d) => (err += d.toString()))
+    p.on('error', (e) => reject(new Error(`调不起 ffmpeg（${exe}）：${e.message}`)))
+    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error('ffmpeg 失败: ' + err.slice(-300)))))
+  })
+}
+
 function transcribeWav(wavPath) {
   const sherpa = require(SHERPA)
   const rec = getRecognizer()
@@ -47,151 +166,166 @@ function transcribeWav(wavPath) {
   const stream = rec.createStream()
   stream.acceptWaveform({ samples: wave.samples, sampleRate: wave.sampleRate })
   rec.decode(stream)
-  return rec.getResult(stream).text
+  return rec.getResult(stream).text || ''
 }
 
-/** 把任意音频转成 16k 单声道 wav */
-function toWav16k(input, output) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(FFMPEG, ['-y', '-i', input, '-ar', '16000', '-ac', '1', output])
-    let err = ''
-    p.stderr.on('data', (d) => (err += d))
-    p.on('close', (code) => (code === 0 ? resolve(output) : reject(new Error(err.slice(-300)))))
-  })
-}
-
-// ---------- TTS（F5 常驻 Python 进程） ----------
-const f5Job = { proc: null, ready: false, queue: [], waiting: new Map(), seq: 0 }
+// ---------- TTS ----------
+const f5 = { proc: null, ready: false, seq: 0, pending: new Map() }
 
 function startF5() {
-  if (f5Job.proc) return
-  const proc = spawn(PY, [F5_SCRIPT], { stdio: ['pipe', 'pipe', 'pipe'] })
-  f5Job.proc = proc
+  if (f5.proc || !DEFAULT_VOICE) return
+  const v = TTS_VOICES[DEFAULT_VOICE]
+  if (!v) return
+  if (!fs.existsSync(v.ckpt)) {
+    console.error(`[f5] 音色 ckpt 不存在：${v.ckpt}`)
+    return
+  }
+  const proc = spawn(PY, [F5_SCRIPT], {
+    env: {
+      ...process.env,
+      PYTHONIOENCODING: 'utf-8',
+      VOICE_TTS_CKPT: v.ckpt,
+      VOICE_TTS_REF: v.ref || '',
+      VOICE_TTS_REF_TEXT: v.refText || '',
+      VOICE_TTS_SPEED: String(v.speed || 0.85),
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  })
+  f5.proc = proc
   let buf = ''
-  proc.stdout.on('data', (chunk) => {
-    buf += chunk.toString('utf8')
-    let idx
-    while ((idx = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, idx).trim()
-      buf = buf.slice(idx + 1)
-      if (!line) continue
+  proc.stdout.on('data', (d) => {
+    buf += d.toString('utf8')
+    const lines = buf.split('\n')
+    buf = lines.pop() || ''
+    for (const line of lines) {
+      if (!line.trim()) continue
       let msg
-      try { msg = JSON.parse(line) } catch { continue }
-      if (msg.ready) { f5Job.ready = true; console.log('[f5] ready'); continue }
-      const cb = f5Job.waiting.get(msg.id)
-      if (cb) { f5Job.waiting.delete(msg.id); cb(msg) }
+      try {
+        msg = JSON.parse(line)
+      } catch {
+        continue
+      }
+      if (msg.ready) {
+        f5.ready = true
+        console.log('[f5] ready')
+        continue
+      }
+      const job = f5.pending.get(msg.id)
+      if (job) {
+        f5.pending.delete(msg.id)
+        msg.ok ? job.resolve(msg.out) : job.reject(new Error(msg.error || 'TTS 失败'))
+      }
     }
   })
-  proc.stderr.on('data', (d) => process.stderr.write('[f5-err] ' + d.toString().slice(0, 300)))
-  proc.on('exit', (code) => { f5Job.proc = null; f5Job.ready = false; console.log('[f5] exit', code) })
+  proc.stderr.on('data', (d) => console.error('[f5-err]', d.toString().slice(0, 300)))
+  proc.on('exit', (code) => {
+    console.warn('[f5] 退出 code=', code)
+    f5.proc = null
+    f5.ready = false
+  })
 }
 
-function synth(text, outPath, speed = 0.9) {
+function synth(text, outPath, speed) {
   return new Promise((resolve, reject) => {
-    startF5()
-    const id = ++f5Job.seq
-    const timer = setTimeout(() => { f5Job.waiting.delete(id); reject(new Error('TTS 超时')) }, 60000)
-    f5Job.waiting.set(id, (msg) => {
-      clearTimeout(timer)
-      if (msg.ok) resolve(msg.out)
-      else reject(new Error(msg.error || 'TTS 失败'))
-    })
-    f5Job.proc.stdin.write(JSON.stringify({ id, text, out: outPath }) + '\n')
+    if (!f5.proc) startF5()
+    if (!f5.proc) return reject(new Error('TTS 没启动（缺音色配置）'))
+    const id = ++f5.seq
+    f5.pending.set(id, { resolve, reject })
+    f5.proc.stdin.write(JSON.stringify({ id, text, out: outPath, speed: speed || 0.85 }) + '\n')
   })
 }
 
 // ---------- HTTP ----------
-function logLine(...args) {
-  try { fs.appendFileSync(path.join(__dirname, 'svc-access.log'), new Date().toISOString() + ' ' + args.map(String).join(' ') + '\n') } catch {}
+function send(res, code, obj) {
+  res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*' })
+  res.end(JSON.stringify(obj))
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', reject)
+  })
 }
 
 const server = http.createServer(async (req, res) => {
-  const send = (code, obj) => {
-    res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'access-control-allow-origin': '*', 'access-control-allow-private-network': 'true' })
-    res.end(JSON.stringify(obj))
-  }
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'access-control-allow-origin': '*',
-      'access-control-allow-headers': 'content-type',
-      'access-control-allow-methods': 'POST,GET,OPTIONS',
-      'access-control-allow-private-network': 'true',
-    })
-    return res.end()
-  }
-
   const url = new URL(req.url, 'http://x')
 
   if (url.pathname === '/health') {
-    return send(200, { ok: true, asr: !!recognizer, tts: f5Job.ready })
+    return send(res, 200, {
+      ok: true,
+      sherpa: !!SHERPA,
+      tts: f5.ready,
+      voice: DEFAULT_VOICE,
+      voices: Object.keys(TTS_VOICES),
+      missing: selfCheck(),
+    })
   }
 
-  // POST /asr  音频二进制（webm/wav 都行）→ { text }
   if (url.pathname === '/asr' && req.method === 'POST') {
-    logLine('[asr] 收到请求', req.headers['content-type'], req.headers['content-length'])
-    const chunks = []
-    for await (const c of req) chunks.push(c)
-    const buf = Buffer.concat(chunks)
-    logLine('[asr] 读完 body', buf.length)
-    if (!buf.length) return send(400, { ok: false, error: '空音频' })
+    const buf = await readBody(req)
+    if (!buf.length) return send(res, 400, { ok: false, error: '空音频' })
     const stamp = Date.now()
-    const rawIn = path.join(TMP, `in-${stamp}.webm`)
+    const rawIn = path.join(TMP, `in-${stamp}.bin`)
     const wavIn = path.join(TMP, `in-${stamp}.wav`)
     fs.writeFileSync(rawIn, buf)
     try {
-      logLine('[asr] ffmpeg 转换开始')
+      const t0 = Date.now()
       await toWav16k(rawIn, wavIn)
-      logLine('[asr] ffmpeg 转换完成')
-      const t0 = Date.now()
-      logLine('[asr] 开始识别')
       const text = transcribeWav(wavIn)
-      logLine('[asr] 识别完成:', text)
-      send(200, { ok: true, text, ms: Date.now() - t0 })
+      send(res, 200, { ok: true, text, ms: Date.now() - t0 })
     } catch (e) {
-      send(500, { ok: false, error: String(e.message || e) })
+      send(res, 500, { ok: false, error: String(e.message || e) })
     } finally {
-      fs.rmSync(rawIn, { force: true })
-      fs.rmSync(wavIn, { force: true })
+      try {
+        fs.unlinkSync(rawIn)
+      } catch {}
+      try {
+        fs.unlinkSync(wavIn)
+      } catch {}
     }
     return
   }
 
-  // POST /tts  { text } → wav 二进制
   if (url.pathname === '/tts' && req.method === 'POST') {
-    const chunks = []
-    for await (const c of req) chunks.push(c)
-    let body = {}
-    try { body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') } catch {}
-    const text = (body.text || '').trim()
-    if (!text) return send(400, { ok: false, error: '空文本' })
-    const out = path.join(TMP, `tts-${Date.now()}.wav`)
     try {
-      const t0 = Date.now()
-      await synth(text, out, body.speed || 0.9)
-      const data = fs.readFileSync(out)
-      res.writeHead(200, {
-        'content-type': 'audio/wav',
-        'content-length': data.length,
-        'access-control-allow-origin': '*',
-        'access-control-allow-private-network': 'true',
-        'x-elapsed-ms': String(Date.now() - t0),
-      })
-      res.end(data)
+      const body = JSON.parse((await readBody(req)).toString('utf8') || '{}')
+      const text = String(body.text || '').trim()
+      if (!text) return send(res, 400, { ok: false, error: 'text 为空' })
+      const out = path.join(TMP, `out-${Date.now()}.wav`)
+      await synth(text, out, body.speed)
+      const buf = fs.readFileSync(out)
+      try {
+        fs.unlinkSync(out)
+      } catch {}
+      res.writeHead(200, { 'content-type': 'audio/wav', 'content-length': buf.length, 'access-control-allow-origin': '*' })
+      res.end(buf)
     } catch (e) {
-      send(500, { ok: false, error: String(e.message || e) })
-    } finally {
-      fs.rmSync(out, { force: true })
+      send(res, 500, { ok: false, error: String(e.message || e) })
     }
     return
   }
 
-  send(404, { ok: false, error: 'not found' })
+  send(res, 404, { ok: false, error: 'not found' })
 })
 
-const PORT = 7788
+const PORT = Number(process.env.VOICE_PORT || cfg.port) || 7788
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`voice service on http://127.0.0.1:${PORT}`)
-  getRecognizer()   // 预热 ASR
-  startF5()         // 预热 F5
-  console.log('ASR + TTS 预热中…')
+  const miss = selfCheck()
+  if (miss.length) {
+    console.log('⚠ 缺依赖：')
+    for (const m of miss) console.log(`  - ${m.what} → ${m.how}`)
+  } else {
+    console.log('依赖齐全，预热 ASR + TTS…')
+    try {
+      getRecognizer()
+      console.log('ASR ready')
+    } catch (e) {
+      console.error('ASR 预热失败:', e.message)
+    }
+    startF5()
+  }
 })

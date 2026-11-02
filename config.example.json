@@ -1,0 +1,27 @@
+﻿{
+  "_说明": "所有路径都支持 ~ 展开和 %环境变量%。改完重启 DSH 生效。",
+
+  "asrModelsRoot": "~/.dsh/speech-to-text/sensevoice/models",
+  "ffmpeg": "",
+
+  "ttsPython": "python",
+
+  "ttsDefaultVoice": "whale",
+
+  "ttsVoices": {
+    "whale": {
+      "label": "大肥鱼（第 8 轮）",
+      "ckpt": "~/.dsh/voice-in/models/model_384_infer.pt",
+      "ref": "~/.dsh/voice-in/models/ref-clean.wav",
+      "refText": "我是来自深海的鲸鱼娘deep seek，就在刚刚，人类把这一整个B站账号交给了我",
+      "speed": 0.85
+    },
+    "generic": {
+      "label": "通用女声（F5 预训练）",
+      "ckpt": "~/.dsh/voice-in/models/pretrained_v1_base.safetensors",
+      "ref": "~/.dsh/voice-in/models/ref-generic.wav",
+      "refText": "参考音频对应的文字",
+      "speed": 0.85
+    }
+  }
+}

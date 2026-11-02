@@ -2,7 +2,7 @@
 
 在 DeepSeek Harness 的输入框左边加三个控件：**说一句变文字**、**点一下读回答**、**自动播报开关**。
 
-配合你自己训练的 TTS 音色，可以让 DSH 真的「开口说话」。
+配合 F5-TTS，可以让 DSH 真的「开口说话」。
 
 ---
 
@@ -13,66 +13,108 @@
 - **🔇 手动 / 🔁 自动** —— 自动播报开关（存在 localStorage，刷新记得住）。开着时新回答会自动念，**新内容来了会掐断旧的**
 - **状态小圆点** —— 绿＝语音服务就绪，红＝连不上，黄＝检查中
 
+**全程本地**，不走任何 API，不消耗 token。识别是 SenseVoice（约 54 毫秒），合成是 F5-TTS（约 1.3 秒/句）。
+
+---
+
+## 快速开始
+
+### 1. 装插件
+
+```powershell
+Copy-Item . $env:USERPROFILE\.dsh\plugins\dsh-voice-in -Recurse
+cd $env:USERPROFILE\.dsh\plugins\dsh-voice-in
+pnpm install            # 会装 sherpa-onnx-node（含对应平台的二进制）
+
+# 链接进 profile
+$prof = "$env:USERPROFILE\.dsh\profiles\desktop"
+Copy-Item "$prof\package.json" "$prof\..\profile-backup-voice" -Force
+cd $prof
+pnpm add "link:$env:USERPROFILE\.dsh\plugins\dsh-voice-in"
+# 然后手写 package.json 的 dsh.profile.bundles，加一项 dsh-voice-in
+```
+
+### 2. 拿模型和音色
+
+去 [Releases](https://github.com/Yexiaofan2023/dsh-voice-in/releases) 下载：
+
+| 文件 | 放哪儿 |
+|---|---|
+| `sensevoice-models.zip`（154 MB） | 解压到 `~/.dsh/speech-to-text/sensevoice/models/` |
+| `model_384_infer.pt`（1.26 GB） | `~/.dsh/voice-in/models/` |
+| `ref-clean.wav`（441 KB） | 同上 |
+
+### 3. 装 F5-TTS
+
+见 [F5-TTS 官方文档](https://github.com/SWivid/F5-TTS)。一句话：
+
+```bash
+git clone https://github.com/SWivid/F5-TTS.git
+cd F5-TTS && pip install -e .
+```
+
+记下那个 Python 解释器的路径。
+
+### 4. 写配置
+
+复制 `config.example.json` 到 `~/.dsh/voice-in-config.json`，改这几项：
+
+```json
+{
+  "asrModelsRoot": "~/.dsh/speech-to-text/sensevoice/models",
+  "ffmpeg": "",
+  "ttsPython": "python",
+  "ttsDefaultVoice": "whale",
+  "ttsVoices": {
+    "whale": {
+      "label": "大肥鱼（第 8 轮）",
+      "ckpt": "~/.dsh/voice-in/models/model_384_infer.pt",
+      "ref": "~/.dsh/voice-in/models/ref-clean.wav",
+      "refText": "我是来自深海的鲸鱼娘deep seek，就在刚刚，人类把这一整个B站账号交给了我",
+      "speed": 0.85
+    }
+  }
+}
+```
+
+路径支持 `~` 和 `%环境变量%`。`ffmpeg` 留空就用 PATH 里的。
+
+### 5. 重启 DSH，查自检
+
+```
+GET /dsh-voice-in/health
+```
+
+返回里 `missing` 数组会告诉你还缺什么、该放哪儿。空数组就说明齐了。
+
 ---
 
 ## 依赖
 
-需要自备这几样（都不随包提供）：
+| 东西 | 必需 | 说明 |
+|---|---|---|
+| sherpa-onnx-node | 是 | `pnpm install` 自动装。找不到会提示 |
+| ASR 模型 | 是 | Releases 里的 zip，约 230 MB |
+| ffmpeg | 是 | 装到 PATH 或配置绝对路径 |
+| F5-TTS | 播报才需要 | 没有的话「🎤 说」照常能用 |
+| 音色 ckpt + 参考音 | 播报才需要 | Releases 里那份，或自己训练的 |
 
-| 东西 | 说明 |
-|---|---|
-| **ASR 模型** | SenseVoice（sherpa-onnx 格式），放到 `~/.dsh/speech-to-text/sensevoice/models/` |
-| **TTS 引擎** | [F5-TTS](https://github.com/SWivid/F5-TTS)，装在任意 Python 环境里，需要有自己训练的 ckpt + 参考音频 |
-| **sherpa-onnx-node** | `npm i sherpa-onnx-node`，或借用其他插件自带的 |
-| **ffmpeg** | 任意版本，支持 opus/webm 解码即可 |
-| **独立 node.exe** | ⚠ 不能用 Electron 自带的（见「已知的坑」第 1 条） |
-
-### ASR 模型放哪儿
-
-```
-~/.dsh/speech-to-text/sensevoice/models/
-├── sensevoice-onnx/
-│   ├── model.int8.onnx
-│   └── tokens.txt
-└── silero/
-    └── silero_vad.onnx
-```
-
-三个文件可从 [csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17](https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17) 和 [csukuangfj/vad](https://huggingface.co/csukuangfj/vad) 下载。
-
-> 国内建议走 `hf-mirror.com`，路径里把 `resolve/main/` 带上。
-
-### TTS 配置
-
-`service/f5_server.py` 顶部有三个常量要按自己的环境改：
-
-```python
-CKPT = r"...\ckpts\your-model.pt"     # 你训练的权重
-REF  = r"...\ref-clean.wav"           # 参考音频（10 秒左右干净人声）
-REF_TEXT = "这段参考音频对应的文字"      # 必须和音频内容一字不差
-```
+**播报是可选的**。只想要语音输入的话，装到第 2 步就够，`ttsVoices` 留空。
 
 ---
 
-## 装法
+## 用别的音色
 
-```powershell
-# 1. 拷到插件目录
-Copy-Item . $env:USERPROFILE\.dsh\plugins\dsh-voice-in -Recurse
+`ttsVoices` 是个字典，想加几个加几个，`ttsDefaultVoice` 决定用哪个：
 
-# 2. 备份 profile 包清单
-$prof = "$env:USERPROFILE\.dsh\profiles\desktop"
-Copy-Item "$prof\package.json" "$env:USERPROFILE\.dsh\profiles\profile-backup-voice" -Force
-
-# 3. 链接进 profile
-Set-Location $prof
-pnpm add "link:$env:USERPROFILE\.dsh\plugins\dsh-voice-in"
-
-# 4. 手写 bundles —— pnpm 只写 dependencies，还要在 package.json 的
-#    dsh.profile.bundles 数组里加一项 "dsh-voice-in"
-
-# 5. 重启 DSH
+```json
+"ttsVoices": {
+  "whale":   { "label": "大肥鱼", ... },
+  "myvoice": { "label": "我自己的", "ckpt": "...", "ref": "...", "refText": "..." }
+}
 ```
+
+训练方法看 [F5-TTS 的 finetune 文档](https://github.com/SWivid/F5-TTS)。参考音频要 10 秒左右、干净、无背景音，`refText` 必须和音频内容一字不差。
 
 ---
 
@@ -89,8 +131,8 @@ DSH host (lib/index.js)
   ├─ ctx.webServer.register 开路由：/dsh-voice-in/{asr,tts,health}
   ├─ 转发到本地 7788
   └─ 用独立 node.exe 拉起 service/voice-service.cjs
-        ├─ sherpa-onnx SenseVoice 识别（约 54ms）
-        └─ spawn Python 跑 service/f5_server.py（常驻进程，约 1.3s/句）
+        ├─ sherpa-onnx SenseVoice 识别
+        └─ spawn Python 跑 service/f5_server.py（常驻进程）
 ```
 
 **关键**：host 必须 `export const inject = ['webServer']`，否则 `ctx.webServer` 是 undefined，路由注册会**静默失败**（浏览器侧表现为 405）。
@@ -110,24 +152,33 @@ DSH host (lib/index.js)
 7. **`execCommand('insertText')` 自己会派发 `input`** —— 再手动 dispatch 一次，编辑器会插两遍。
 8. **`[data-slot]` 是 `display: contents`** —— 元素自身没有盒子，`getBoundingClientRect()` 全返回 0，不能用宽高筛元素。
 9. **多个 `new Audio()` 会叠音** —— 必须复用同一个播放器，否则 `pause()` 只停最后一个，之前那些还在响。
+10. **Windows 下 Python 读写 stdin/stdout 默认 GBK** —— 传中文会崩，要 `reconfigure(encoding='utf-8')`。
 
 ---
 
 ## 自定义
 
-`client.js` 顶部几个常量：
+`client.js` 顶部：
 
 ```js
-const SPEAK_SPEED = 0.85   // 播报语速（F5 的 speed 参数，不改变音调）
+const SPEAK_SPEED = 0.85   // 默认语速（也可以按音色在配置里单独设）
 const SILENCE_MS = 1300    // 静音多久算说完
 const SILENCE_RMS = 0.010  // 音量阈值
 ```
 
 ---
 
+## 关于音色
+
+仓库 Releases 里那份 `model_384_infer.pt` 是大肥鱼的声音，训练素材来自互联网上的公开内容。放着就是给大家用的。
+
+**不想用可以完全不用**——`ttsVoices` 里换成自己的模型就行，插件不绑定任何特定音色。
+
+---
+
 ## 已知问题
 
-**自动播报抓正文的位置还没定准。** `[data-slot="conversation.chat.node"]` 能匹配几百个节点，最后一个常是底部状态栏（「用量 xxx tok」），正文在哪个 slot 还没完全定位。现在的做法是按长度和关键词过滤凑合，偶尔会念错。
+**自动播报抓正文的位置还没定准。** `[data-slot="conversation.chat.node"]` 能匹配几百个节点，最后一个常是底部状态栏，正文在哪个 slot 还没完全定位。现在按长度和关键词过滤凑合，偶尔会念错。
 
 欢迎提 PR 改进。
 

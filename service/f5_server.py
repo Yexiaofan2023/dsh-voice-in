@@ -1,24 +1,31 @@
-"""F5-TTS 常驻服务：读 stdin 的 JSON 行，合成后回一行 JSON。
+"""
+F5-TTS 常驻工作进程。
 
-输入:  {"id": 1, "text": "要说的话", "out": "输出路径.wav"}
-输出:  {"id": 1, "ok": true, "out": "..."} 或 {"id":1,"ok":false,"error":"..."}
-就绪:  {"ready": true}
+从环境变量读配置（由 voice-service.cjs 传进来）：
+  VOICE_TTS_CKPT      权重文件路径
+  VOICE_TTS_REF       参考音频路径
+  VOICE_TTS_REF_TEXT  参考音频对应的文字
+  VOICE_TTS_SPEED     语速（默认 0.85）
+  VOICE_TTS_DEVICE    设备（默认 cuda，不可用时自动退回 cpu）
+
+协议：stdin 每行一个 JSON {id, text, out, speed}
+     stdout 每行一个 JSON {"ready":true} 或 {id, ok, out} / {id, ok:false, error}
 """
 import sys
 import os
 import json
 
-# Windows 下 stdin/stdout 默认走系统编码（GBK），中文 JSON 会被读坏成 surrogate。
-# 必须显式切到 UTF-8，否则会报 "'utf-8' codec can't encode character '\udca4'".
+# Windows 下 stdin/stdout 默认是 GBK，必须改成 UTF-8，否则中文会崩
 if sys.platform == "win32":
     sys.stdin.reconfigure(encoding="utf-8", errors="replace")
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
-
-CKPT = r"D:\实用软件\tts-venv\Lib\ckpts\whale2\model_384.pt"
-REF = r"C:\Users\yexiaofan\Documents\deepseek-harness\default-workspace\tts\ref-clean.wav"
-REF_TEXT = "我是来自深海的鲸鱼娘deep seek，就在刚刚，人类把这一整个B站账号交给了我"
+CKPT = os.environ.get("VOICE_TTS_CKPT", "")
+REF = os.environ.get("VOICE_TTS_REF", "")
+REF_TEXT = os.environ.get("VOICE_TTS_REF_TEXT", "")
+DEFAULT_SPEED = float(os.environ.get("VOICE_TTS_SPEED", "0.85"))
+DEVICE = os.environ.get("VOICE_TTS_DEVICE", "cuda")
 
 
 def emit(obj):
@@ -27,10 +34,22 @@ def emit(obj):
 
 
 def main():
-    from f5_tts.api import F5TTS
-    import soundfile as sf
+    if not CKPT or not os.path.exists(CKPT):
+        emit({"ready": False, "error": "ckpt 不存在: " + str(CKPT)})
+        return
+    if REF and not os.path.exists(REF):
+        emit({"ready": False, "error": "参考音频不存在: " + str(REF)})
+        return
 
-    tts = F5TTS(model="F5TTS_v1_Base", ckpt_file=CKPT, device="cuda")
+    import soundfile as sf
+    from f5_tts.api import F5TTS
+
+    try:
+        tts = F5TTS(model="F5TTS_v1_Base", ckpt_file=CKPT, device=DEVICE)
+    except Exception:
+        # 显卡不可用时退回 CPU（慢很多，但至少能用）
+        tts = F5TTS(model="F5TTS_v1_Base", ckpt_file=CKPT, device="cpu")
+
     emit({"ready": True})
 
     for line in sys.stdin:
@@ -41,12 +60,14 @@ def main():
             job = json.loads(line)
         except Exception:
             continue
+
         text = (job.get("text") or "").strip()
-        speed = float(job.get("speed") or 0.9)
+        speed = float(job.get("speed") or DEFAULT_SPEED)
         out = job.get("out") or ""
         if not text or not out:
             emit({"id": job.get("id"), "ok": False, "error": "text/out 为空"})
             continue
+
         try:
             wav, sr, _ = tts.infer(
                 ref_file=REF,

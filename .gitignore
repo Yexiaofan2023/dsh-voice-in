@@ -1,9 +1,18 @@
-﻿# 运行产物
+# 本机配置（含绝对路径，不要提交）
+config.json
+
+# 运行产物
 *.log
 *.err
 svc-access.log
 tmp/
 service/tmp/
+
+# 模型与音色（走 GitHub Releases，不进仓库）
+*.pt
+*.safetensors
+*.onnx
+models/
 
 # 系统/编辑器
 .DS_Store
