@@ -240,10 +240,13 @@ window.__ModuleLoader__.load({
           }
           const j = await res.json()
           if (j.ok && j.text) {
-            if (fillInput(j.text)) { setState('ok'); setHint(j.text.slice(0, 12)) }
+            // 短句不加标点：一两个字还带个句号，看着很怪（用户 2026-11-03 要求）
+            let txt = String(j.text).trim()
+            const bare = txt.replace(/[。！？，、；：!?.,;:]+$/g, '')
+            if (bare.length <= 10) txt = bare
+            if (fillInput(txt)) { setState('ok'); setHint(txt.slice(0, 12)) }
             else { setState('idle'); setHint('没找到输入框') }
           } else {
-            setState('idle'); setHint(j.error ? String(j.error).slice(0, 28) : '没听清')
           }
         } catch (e) {
           const msg = String((e && e.message) || e)
@@ -457,7 +460,15 @@ window.__ModuleLoader__.load({
       /** 立刻掐断当前播报（新回答来了要抢占） */
       const stopPlayback = React.useCallback(() => {
         playTokenRef.current++            // 令牌一变，正在跑的循环下一次检查就会退出
-        try { audioRef.current?.pause() } catch {}
+        try {
+          if (audioRef.current) {
+            audioRef.current.pause()
+            audioRef.current.src = ''      // 清掉源，防止已经排到队列里的那句接着响
+            audioRef.current.onended = null
+            audioRef.current.onerror = null
+            audioRef.current.onpause = null
+          }
+        } catch {}
         audioRef.current = null
         setSpeak('idle'); setHint('')
       }, [])
@@ -486,7 +497,50 @@ window.__ModuleLoader__.load({
           .split(/\r?\n/)
           .filter(looksLikeProse)
           .join('\n')
-        const clean = kept.replace(/`[\s\S]*?`/g, '。').replace(/[#*>|]/g, '').replace(/\s+/g, ' ').trim()
+        // 数字转中文：F5 遇到数字会按英文读，长串还连读得飞快。
+        // 年份逐位读（2026 → 二零二六），普通整数按数值读，小数按位读。
+        const cnDigit = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九']
+        const intToCn = (s) => {
+          s = String(s).replace(/^0+(?=\d)/, '')
+          if (s === '0') return '零'
+          if (s.length > 12) return s.split('').map((d) => cnDigit[+d]).join('')  // 太长逐位读
+          const unit = ['', '十', '百', '千']
+          const bigUnit = ['', '万', '亿']
+          let out = ''
+          let group = 0
+          while (s.length) {
+            const chunk = s.slice(-4)
+            s = s.slice(0, -4)
+            let part = ''
+            for (let i = 0; i < chunk.length; i++) {
+              const d = +chunk[i]
+              const pos = chunk.length - 1 - i
+              if (d === 0) { if (part && !part.endsWith('零')) part += '零' }
+              else part += cnDigit[d] + unit[pos]
+            }
+            part = part.replace(/零+$/, '')
+            if (part) out = part + bigUnit[group] + out
+            group++
+          }
+          out = out.replace(/零+/g, '零').replace(/^一十/, '十')
+          return out || '零'
+        }
+        const numToCn = (s) => {
+          // 4 位且像年份：逐位
+          if (/^(19|20)\d{2}$/.test(s)) return s.split('').map((d) => cnDigit[+d]).join('')
+          // 带小数点
+          if (s.includes('.')) {
+            const [a, b] = s.split('.')
+            return intToCn(a) + '点' + b.split('').map((d) => cnDigit[+d]).join('')
+          }
+          return intToCn(s)
+        }
+        const clean = kept
+          .replace(/```[\s\S]*?```/g, '。')
+          .replace(/[#*`>|]/g, '')
+          .replace(/\d+(?:\.\d+)?/g, (m) => numToCn(m))
+          .replace(/\s+/g, ' ')
+          .trim()
         // 按句切，但把过短的碎片并到前一句，减少「念一句、停一下」的碎裂感
         const parts = clean.split(/(?<=[。！？；\n])/).map((s) => s.trim()).filter(Boolean)
         const sentences = []
@@ -553,24 +607,34 @@ window.__ModuleLoader__.load({
       /** 手动：点一下读最后一条（正在播就停） */
       const readLastAnswer = React.useCallback(() => {
         if (speak === 'playing' || speak === 'loading') {
-          try { audioRef.current?.pause() } catch {}
-          audioRef.current = null
-          setSpeak('idle'); setHint('')
+          stopPlayback()          // 必须走统一的抢占逻辑：只 pause 不会让逐句循环退出
           return
         }
         const picked = pickLastAnswer()
         if (!picked.text) { setHint('没找到回答'); setTimeout(() => setHint(''), 2500); return }
-        lastSpokenRef.current = picked.key
+        lastSpokenRef.current = textKey(picked.text)
         speakText(picked.text)
-      }, [speak, pickLastAnswer, speakText])
+      }, [speak, pickLastAnswer, speakText, stopPlayback])
 
       /** 自动：开关打开时轮询最后一条回答，变了就读 */
       // speak 用 ref 存，别塞进 effect 依赖——否则每次状态变化都会重建 interval，
       // 日志里「自动播报已开启」会刷一串，还可能叠出多条轮询同时触发
       const speakStateRef = React.useRef(speak)
       React.useEffect(() => { speakStateRef.current = speak }, [speak])
-      // 「这条回答说完了吗」的判定：文本连续 1.2 秒不再变，才认为流式输出结束
+      // 「这条回答说完了吗」的判定：文本连续 1.5 秒不再变，才认为流式输出结束
       const stableRef = React.useRef({ key: '', at: 0 })
+      // 用「文本内容」算指纹，不要用「第几个节点 + 字数」——节点序号和字数会随渲染抖动，
+      // 一抖就被当成新回答，于是同一条反复念、怎么点停都停不下来。
+      // 只取前 200 字做指纹：回答末尾常挂「用时 xx 秒 / 用量 xx tok」这类每帧都在变的尾巴，
+      // 拿全文算指纹的话，尾巴一变就等于"新回答"，于是同一段被无限重念。
+      const textKey = (t) => {
+        const s = String(t || '').replace(/\s+/g, '').slice(0, 200)
+        let h = 0
+        for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
+        return (h >>> 0).toString(36) + ':' + s.length
+      }
+      // 自动播报念过的指纹集合：同一条回答只念一次，除非内容真的变了（前缀变了）
+      const autoSpokenRef = React.useRef(new Set())
 
       // 换了会话就把播报状态归零，别把新会话的旧消息当成新回答念一遍。
       // URL 和页面标题一起看——DSH 是单页应用，切会话不一定改 URL，但标题通常跟着变。
@@ -585,7 +649,7 @@ window.__ModuleLoader__.load({
           hrefRef.current = location.href
           titleRef.current = document.title
           stopPlayback()
-          lastSpokenRef.current = pickLastAnswer().key   // 记下当前这条，但不念
+          lastSpokenRef.current = textKey(pickLastAnswer().text)   // 记下当前这条，但不念
           stableRef.current = { key: '', at: 0 }
           console.log('[voice-in] 检测到会话切换（' + (changedHref ? 'URL' : '标题') + '变了），播报状态已重置 |', document.title)
         }, 800)
@@ -599,8 +663,9 @@ window.__ModuleLoader__.load({
         const id = setInterval(() => {
           const picked = pickLastAnswer()
           if (!picked.text || picked.text.length < 4) return
-          // 同一条就跳过（key 由选择器+序号+长度组成，稳定不变）
-          if (picked.key === lastSpokenRef.current) return
+          // 同一条就跳过（指纹 = 去空白后哈希 + 长度，页面重渲也不会变）
+          const key = textKey(picked.text)
+          if (key === lastSpokenRef.current) return
 
           // 新回答出现了，正在播旧的 → 立刻掐断，改念新的（不等旧的那条念完）
           if (speakStateRef.current !== 'idle') {
@@ -608,14 +673,14 @@ window.__ModuleLoader__.load({
             stopPlayback()
           }
 
-          // 流式输出还没停：等文本稳定 1.2 秒再念，避免念半句
+          // 流式输出还没停：等文本稳定 1.5 秒再念，避免念半句
           const now = Date.now()
-          if (stableRef.current.key !== picked.key) {
-            stableRef.current = { key: picked.key, at: now }
+          if (stableRef.current.key !== key) {
+            stableRef.current = { key, at: now }
             return
           }
-          if (now - stableRef.current.at < 1200) return
-          lastSpokenRef.current = picked.key
+          if (now - stableRef.current.at < 1500) return
+          lastSpokenRef.current = key
           stableRef.current = { key: '', at: 0 }
           console.log('[voice-in] 自动播报触发 from=', picked.from, 'index=', picked.index, '/', picked.total, '长度', picked.text.length, '|', picked.text.slice(0, 30))
           speakText(picked.text)
@@ -675,7 +740,7 @@ window.__ModuleLoader__.load({
                 audioRef.current = null
                 setSpeak('idle'); setHint('')
               } else {
-                lastSpokenRef.current = pickLastAnswer().key   // 打开时把当前这条记下，别立刻念旧的
+                lastSpokenRef.current = textKey(pickLastAnswer().text)   // 打开时把当前这条记下，别立刻念旧的
                 stableRef.current = { key: '', at: 0 }
                 setHint('自动播报已开')
                 setTimeout(() => setHint(''), 2000)
