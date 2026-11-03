@@ -220,8 +220,15 @@ function startF5() {
   proc.stderr.on('data', (d) => console.error('[f5-err]', d.toString().slice(0, 300)))
   proc.on('exit', (code) => {
     console.warn('[f5] 退出 code=', code)
+    // ⭐ 2026-11-03：f5 半路崩掉时，排队等结果的请求必须**立刻失败**。
+    //    否则那几个 Promise 永远不 settle，前端 await 卡死、朗读停不下来。
+    const waiting = Array.from(f5.pending.values())
+    f5.pending.clear()
     f5.proc = null
     f5.ready = false
+    for (const job of waiting) {
+      try { job.reject(new Error('f5 退出了（code=' + code + '），这句没合成出来')) } catch (e) {}
+    }
   })
 }
 
@@ -258,15 +265,30 @@ function send(res, code, obj) {
   res.end(JSON.stringify(obj))
 }
 
-function readBody(req) {
+// ⭐ 2026-11-03：加体积上限。原来无限收，一个超大上传就能把内存/磁盘吃满。
+const MAX_BODY = 32 * 1024 * 1024
+function readBody(req, limit = MAX_BODY) {
   return new Promise((resolve, reject) => {
     const chunks = []
-    req.on('data', (c) => chunks.push(c))
-    req.on('end', () => resolve(Buffer.concat(chunks)))
-    req.on('error', reject)
+    let size = 0
+    let done = false
+    req.on('data', (c) => {
+      if (done) return
+      size += c.length
+      if (size > limit) {
+        done = true
+        reject(new Error('请求体太大（超过 ' + Math.round(limit / 1048576) + 'MB）'))
+        try { req.destroy() } catch (e) {}
+        return
+      }
+      chunks.push(c)
+    })
+    req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks)) } })
+    req.on('error', (e) => { if (!done) { done = true; reject(e) } })
   })
 }
 
+let TMP_SEQ = 0
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x')
 
@@ -282,9 +304,14 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/asr' && req.method === 'POST') {
-    const buf = await readBody(req)
+    let buf
+    try {
+      buf = await readBody(req)
+    } catch (e) {
+      return send(res, 413, { ok: false, error: String(e.message || e) })
+    }
     if (!buf.length) return send(res, 400, { ok: false, error: '空音频' })
-    const stamp = Date.now()
+    const stamp = Date.now() + '-' + (++TMP_SEQ)
     const rawIn = path.join(TMP, `in-${stamp}.bin`)
     const wavIn = path.join(TMP, `in-${stamp}.wav`)
     fs.writeFileSync(rawIn, buf)
@@ -311,7 +338,7 @@ const server = http.createServer(async (req, res) => {
       const body = JSON.parse((await readBody(req)).toString('utf8') || '{}')
       const text = String(body.text || '').trim()
       if (!text) return send(res, 400, { ok: false, error: 'text 为空' })
-      const out = path.join(TMP, `out-${Date.now()}.wav`)
+      const out = path.join(TMP, `out-${Date.now()}-${++TMP_SEQ}.wav`)
       await synth(text, out, body.speed)
       const buf = fs.readFileSync(out)
       try {
