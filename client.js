@@ -101,42 +101,47 @@ window.__ModuleLoader__.load({
 
       el.focus()
 
-      // 先清空：语音输入是「说一句 = 这句话」，不清会一直往后堆
+      // 在「光标处」插入，不清空整段（2026-11-03：之前总是塞到最末尾）
       if (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT') {
-        // 受控组件：用原型 setter 直接赋最终值，再派发 InputEvent。
-        // 别用 execCommand —— 它会和 React 的受控同步打架，导致同一句被写两遍。
+        // 受控组件：用原型 setter 赋最终值，再派发 InputEvent。
+        // 别用 execCommand —— 它会和 React 的受控同步打架，同一句被写两遍。
         const proto = el.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype
         const setter = Object.getOwnPropertyDescriptor(proto, 'value').set
-        setter.call(el, text)
+        const cur = el.value || ''
+        let s = typeof el.selectionStart === 'number' ? el.selectionStart : cur.length
+        let e = typeof el.selectionEnd === 'number' ? el.selectionEnd : s
+        if (s > cur.length) s = cur.length
+        if (e > cur.length) e = cur.length
+        const next = cur.slice(0, s) + text + cur.slice(e)
+        setter.call(el, next)
+        const caret = s + text.length
+        try { el.setSelectionRange(caret, caret) } catch {}
         el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }))
         el.dispatchEvent(new Event('change', { bubbles: true }))
-        console.log('[voice-in] 填入', el.tagName, '现值:', (el.value || '').slice(-40))
+        console.log('[voice-in] 在位置', s, '-', e, '插入', el.tagName, '| 前 60 字:', (el.value || '').slice(0, 60))
         return true
       }
 
-      // contenteditable：先全选清空
+      // contenteditable：光标在编辑器里就直接用，不在就放末尾
       const sel = window.getSelection()
-      const range = document.createRange()
-      range.selectNodeContents(el)
-      if (sel) { sel.removeAllRanges(); sel.addRange(range) }
-      try { document.execCommand('delete') } catch {}
-      const range2 = document.createRange()
-      range2.selectNodeContents(el)
-      range2.collapse(false)
-      if (sel) { sel.removeAllRanges(); sel.addRange(range2) }
-
+      const hasCaret = sel && sel.rangeCount > 0 && sel.anchorNode && el.contains(sel.anchorNode)
+      if (!hasCaret) {
+        const r = document.createRange()
+        r.selectNodeContents(el)
+        r.collapse(false)
+        if (sel) { sel.removeAllRanges(); sel.addRange(r) }
+      }
       let ok = false
       try { ok = document.execCommand('insertText', false, text) } catch {}
       // ⚠ execCommand 自己已经派发过 beforeinput/input 了，这里绝不能再 dispatch 一次，
-      //   否则编辑器会把同一句插两遍（就是「还是一样的。还是一样的。」那个现象）。
+      //   否则编辑器会把同一句插两遍。
       if (!ok) {
-        el.textContent = text
+        el.textContent = (el.textContent || '') + text
         el.dispatchEvent(new InputEvent('input', { bubbles: true, data: text, inputType: 'insertText' }))
       }
-      // 值要等编辑器渲染完才读得到，延后一拍再量
       setTimeout(() => {
         const now = (el.innerText || el.textContent || '').trim()
-        console.log('[voice-in] contenteditable 填入结果，execCommand=', ok, '长度', now.length, '|', now.slice(-30))
+        console.log('[voice-in] contenteditable 填入结果，execCommand=', ok, '长度', now.length, '| 末 30 字:', now.slice(-30))
       }, 250)
       return true
     }
@@ -309,6 +314,66 @@ window.__ModuleLoader__.load({
       }, [stop])
 
       React.useEffect(() => () => { if (ref.current.recorder) { try { ref.current.recorder.stop() } catch {} } }, [])
+
+      // ---------- 按住说话（push-to-talk）----------
+      // 默认 Ctrl+Shift+Space，按住在听、松开结束。可在 ⚙ 面板里改。
+      const [hotkey, setHotkey] = React.useState(() => {
+        try { return localStorage.getItem('voice-in-hotkey') || 'Ctrl+Shift+Space' } catch { return 'Ctrl+Shift+Space' }
+      })
+      const heldRef = React.useRef(false)
+
+      /** 把按键事件转成 "Ctrl+Shift+Space" 这种字符串 */
+      const comboOf = (e) => {
+        const parts = []
+        if (e.ctrlKey) parts.push('Ctrl')
+        if (e.altKey) parts.push('Alt')
+        if (e.shiftKey) parts.push('Shift')
+        if (e.metaKey) parts.push('Meta')
+        const k = e.code === 'Space' ? 'Space' : (e.key || '').length === 1 ? e.key.toUpperCase() : e.key
+        parts.push(k)
+        return parts.join('+')
+      }
+
+      React.useEffect(() => {
+        try { localStorage.setItem('voice-in-hotkey', hotkey) } catch {}
+        const want = hotkey.toLowerCase()
+
+        const down = (e) => {
+          // 输入框里打字时，只有带修饰键的组合才拦（不然会把正常打字吃掉）
+          if (comboOf(e).toLowerCase() !== want) return
+          e.preventDefault(); e.stopPropagation()
+          if (heldRef.current) return          // 系统按键重复，忽略
+          heldRef.current = true
+          console.log('[voice-in] 快捷键按下，开始录音')
+          if (!ref.current.recorder) start()
+        }
+        const up = (e) => {
+          // 松开时不做组合键匹配：Shift 先松会导致组合串变了
+          if (!heldRef.current) return
+          if (comboOf(e).toLowerCase() === want || e.code === 'Space' || e.key === ' ') {
+            e.preventDefault(); e.stopPropagation()
+            heldRef.current = false
+            console.log('[voice-in] 快捷键松开，结束录音')
+            if (ref.current.recorder) stop()
+          }
+        }
+        // 焦点丢了（alt+tab 之类）收不到 keyup，兜底停掉
+        const blur = () => {
+          if (!heldRef.current) return
+          heldRef.current = false
+          console.log('[voice-in] 失焦，结束录音')
+          if (ref.current.recorder) stop()
+        }
+
+        window.addEventListener('keydown', down, true)
+        window.addEventListener('keyup', up, true)
+        window.addEventListener('blur', blur)
+        return () => {
+          window.removeEventListener('keydown', down, true)
+          window.removeEventListener('keyup', up, true)
+          window.removeEventListener('blur', blur)
+        }
+      }, [hotkey, start, stop])
 
       // ---------- 播报 ----------
       const [speak, setSpeak] = React.useState('idle')  // idle | loading | playing
@@ -598,16 +663,17 @@ window.__ModuleLoader__.load({
           key: 'hint',
           style: { fontSize: 11, color: 'rgba(150,180,215,0.75)', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
         }, hint) : null,
-        h(Panel, { key: 'panel', service: SERVICE, speakText, stopPlayback, fillInput }),
+        h(Panel, { key: 'panel', service: SERVICE, speakText, stopPlayback, fillInput, hotkey, onHotkeySet: setHotkey }),
       ])
     }
 
     /** ⚙ 调试面板：状态、缺什么、音色、试听、配置位置 */
-    function Panel({ service, speakText, stopPlayback, fillInput }) {
+    function Panel({ service, speakText, stopPlayback, fillInput, hotkey, onHotkeySet }) {
       const [open, setOpen] = React.useState(false)
       const [info, setInfo] = React.useState(null)
       const [err, setErr] = React.useState('')
       const [busy, setBusy] = React.useState(false)
+      const [recording, setRecording] = React.useState(false)
       const [testText, setTestText] = React.useState('这是测试语音，听听效果怎么样。')
 
       const load = React.useCallback(async () => {
@@ -689,6 +755,44 @@ window.__ModuleLoader__.load({
           btn('刷新状态', load),
           btn(busy ? '试听中…' : '试听音色', tryTts),
           btn('重置播报状态', () => { stopPlayback(); load() }),
+        ]),
+        // 按住说话的快捷键
+        h('div', { key: 'hk', style: { marginTop: 10, paddingTop: 8, borderTop: '1px solid rgba(120,160,200,0.18)' } }, [
+          h('div', { key: 't', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } }, [
+            h('span', { key: 'k', style: { color: 'rgba(150,170,195,0.75)' } }, '按住说话'),
+            h('span', { key: 'v', style: { color: '#8ec5ff', fontFamily: 'monospace' } },
+              recording ? '按下新组合…' : (hotkey || '（未设置）')),
+          ]),
+          h('div', { key: 'b', style: { display: 'flex', gap: 6, marginTop: 6 } }, [
+            btn(recording ? '取消' : '改快捷键', () => {
+              if (recording) { setRecording(false); return }
+              setRecording(true)
+              // 用一次性的捕获监听抓下一个组合键
+              const grab = (e) => {
+                e.preventDefault(); e.stopPropagation()
+                if (e.key === 'Escape') {
+                  setRecording(false)
+                  window.removeEventListener('keydown', grab, true)
+                  return
+                }
+                const parts = []
+                if (e.ctrlKey) parts.push('Ctrl')
+                if (e.altKey) parts.push('Alt')
+                if (e.shiftKey) parts.push('Shift')
+                if (e.metaKey) parts.push('Meta')
+                const k = e.code === 'Space' ? 'Space' : (e.key || '').length === 1 ? e.key.toUpperCase() : e.key
+                if (!parts.length && !['Space', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6'].includes(k)) return
+                parts.push(k)
+                onHotkeySet(parts.join('+'))
+                setRecording(false)
+                window.removeEventListener('keydown', grab, true)
+              }
+              window.addEventListener('keydown', grab, true)
+            }, recording ? { background: 'rgba(255,150,80,0.2)' } : null),
+            btn('恢复默认', () => onHotkeySet('Ctrl+Shift+Space')),
+          ]),
+          h('div', { key: 'h', style: { marginTop: 5, fontSize: 10.5, color: 'rgba(130,150,175,0.65)' } },
+            '按住在听，松开结束。改的时候按 Escape 取消。'),
         ]),
         h('div', { key: 'hintrow', style: { marginTop: 8, fontSize: 11, color: 'rgba(140,160,185,0.7)' } },
           '配置文件：~/.dsh/voice-in-config.json'),
