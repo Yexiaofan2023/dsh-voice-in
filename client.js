@@ -158,7 +158,7 @@ window.__ModuleLoader__.load({
       const [state, setState] = React.useState('idle')
       const [hint, setHint] = React.useState('')
       const [link, setLink] = React.useState('checking')   // checking | ok | down
-      const ref = React.useRef({ recorder: null, chunks: [], ctx: null, raf: 0, silenceSince: 0 })
+      const ref = React.useRef({ recorder: null, stream: null, chunks: [], ctx: null, raf: 0, silenceSince: 0 })
 
       // 挂载时探一次同源路由，之后每 15 秒复查；状态直接显示在按钮上，不用点也知道通不通
       React.useEffect(() => {
@@ -179,6 +179,11 @@ window.__ModuleLoader__.load({
         return () => { alive = false; clearInterval(id) }
       }, [])
 
+      // 一开口就掐掉正在播报的声音。stopPlayback 定义在后面（播报那节），
+      // 用 ref 转一手，避免 useCallback 的 TDZ 问题。
+      const stopPlaybackRef = React.useRef(() => {})
+
+      const heldRef = React.useRef(false)   // 按住说话是否还按着（在快捷键监听和 stop 之间共享）
       const stop = React.useCallback(async () => {
         const r = ref.current
         console.log('[voice-in] stop() 进入, 有录音器=', !!r.recorder)
@@ -187,6 +192,10 @@ window.__ModuleLoader__.load({
         // 于是两条链路各识别一次、各填一次 —— 表现就是同一句话填了两遍。
         const rec = r.recorder
         r.recorder = null
+        // 关掉麦克风：不关的话系统麦克风指示灯会一直亮着
+        try { if (r.stream) r.stream.getTracks().forEach(function (tk) { tk.stop() }) } catch (e) {}
+        r.stream = null
+        heldRef.current = false   // 录音自己结束（静音断句）时也要清，否则下次按快捷键被挡
         if (!rec) { console.warn('[voice-in] stop 时没有录音器（重复调用，已忽略）'); return }
         if (r.raf) { cancelAnimationFrame(r.raf); r.raf = 0 }
         if (r.ctx) { try { await r.ctx.close() } catch {} ; r.ctx = null }
@@ -247,6 +256,8 @@ window.__ModuleLoader__.load({
 
       const start = React.useCallback(async () => {
         if (ref.current.recorder) return
+        // 用户一开口，先停掉正在念的回答
+        try { stopPlaybackRef.current() } catch {}
         console.log('[voice-in] start() 进入',
           'mediaDevices=', !!navigator.mediaDevices,
           'getUserMedia=', !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia),
@@ -266,6 +277,7 @@ window.__ModuleLoader__.load({
           console.log('[voice-in] MediaRecorder mimeType=', rec.mimeType)
           const r = ref.current
           r.recorder = rec
+          r.stream = stream
           r.chunks = []
           rec.ondataavailable = (e) => { if (e.data && e.data.size) r.chunks.push(e.data) }
           rec.start(200)
@@ -307,20 +319,23 @@ window.__ModuleLoader__.load({
           console.log('[voice-in] 开始录音，等待说话')
         } catch (e) {
           console.error('[voice-in] 麦克风失败:', e && e.name, e && e.message)
+          heldRef.current = false   // 启动失败也要清，否则下次按快捷键被挡
           setState('idle')
           setHint('麦克风: ' + String((e && (e.name || e.message)) || e).slice(0, 24))
           setTimeout(() => { setState('idle'); setHint('') }, 6000)
         }
       }, [stop])
 
-      React.useEffect(() => () => { if (ref.current.recorder) { try { ref.current.recorder.stop() } catch {} } }, [])
+      React.useEffect(() => () => {
+        if (ref.current.recorder) { try { ref.current.recorder.stop() } catch {} }
+        try { if (ref.current.stream) ref.current.stream.getTracks().forEach(function (tk) { tk.stop() }) } catch (e) {}
+      }, [])
 
       // ---------- 按住说话（push-to-talk）----------
       // 默认 Ctrl+Shift+Space，按住在听、松开结束。可在 ⚙ 面板里改。
       const [hotkey, setHotkey] = React.useState(() => {
         try { return localStorage.getItem('voice-in-hotkey') || 'Ctrl+Shift+Space' } catch { return 'Ctrl+Shift+Space' }
       })
-      const heldRef = React.useRef(false)
 
       /** 把按键事件转成 "Ctrl+Shift+Space" 这种字符串 */
       const comboOf = (e) => {
@@ -339,6 +354,7 @@ window.__ModuleLoader__.load({
         const want = hotkey.toLowerCase()
 
         const down = (e) => {
+          if (window.__voiceInRecording) return   // 正在录快捷键，让路
           // 输入框里打字时，只有带修饰键的组合才拦（不然会把正常打字吃掉）
           if (comboOf(e).toLowerCase() !== want) return
           e.preventDefault(); e.stopPropagation()
@@ -348,12 +364,16 @@ window.__ModuleLoader__.load({
           if (!ref.current.recorder) start()
         }
         const up = (e) => {
-          // 松开时不做组合键匹配：Shift 先松会导致组合串变了
+          // 松开时不做组合键整体匹配（Shift 先松会让组合串变），
+          // 但要按「配置里那个主键」匹配——写死 Space 的话，改成别的键就永远松不开，
+          // heldRef 卡在 true，下一次按下被挡住，快捷键就「有时候没反应」。
           if (!heldRef.current) return
-          if (comboOf(e).toLowerCase() === want || e.code === 'Space' || e.key === ' ') {
+          const mainKey = (hotkey.split('+').pop() || '').trim().toLowerCase()
+          const k = (e.code === 'Space' ? 'space' : (e.key || '')).toLowerCase()
+          if (k === mainKey) {
             e.preventDefault(); e.stopPropagation()
             heldRef.current = false
-            console.log('[voice-in] 快捷键松开，结束录音')
+            console.log('[voice-in] 快捷键松开（主键 ' + mainKey + '），结束录音')
             if (ref.current.recorder) stop()
           }
         }
@@ -442,10 +462,31 @@ window.__ModuleLoader__.load({
         setSpeak('idle'); setHint('')
       }, [])
 
+      // 让 start 能拿到最新的 stopPlayback
+      React.useEffect(() => { stopPlaybackRef.current = stopPlayback }, [stopPlayback])
+
       /** 把一段文本拆句后逐句合成播放；返回是否播完 */
       const speakText = React.useCallback(async (raw) => {
         const myToken = ++playTokenRef.current   // 本次播放的令牌
-        const clean = raw.replace(/```[\s\S]*?```/g, '。').replace(/[#*`>|]/g, '').replace(/\s+/g, ' ').trim()
+        // 先按行过滤掉「不像人话」的内容：命令行、日志、代码、路径
+        // 用户反馈：执行命令时连命令本身都被念出来了。
+        const looksLikeProse = (line) => {
+          const s = line.trim()
+          if (!s) return false
+          if (!/[\u4e00-\u9fa5]/.test(s)) return false
+          if (/^\s*[\$>#]/.test(s)) return false
+          if (/\b(Get|Set|New|Remove|Invoke|Start|Stop|Add|Write|Read)-[A-Z]/.test(s)) return false
+          if (/^\s*(pwsh|powershell|node|git|npm|pnpm|curl|ffmpeg|python)\b/i.test(s)) return false
+          if (/\[voice-in\]|\[f5\]|[a-z]+\.(js|cjs|py|json|md|wav|mp3|png)\b/.test(s)) return false
+          const sym = (s.match(/[\\/{}[\]<>_=;|&()]/g) || []).length
+          if (sym > s.length * 0.18) return false
+          return true
+        }
+        const kept = String(raw || '')
+          .split(/\r?\n/)
+          .filter(looksLikeProse)
+          .join('\n')
+        const clean = kept.replace(/`[\s\S]*?`/g, '。').replace(/[#*>|]/g, '').replace(/\s+/g, ' ').trim()
         // 按句切，但把过短的碎片并到前一句，减少「念一句、停一下」的碎裂感
         const parts = clean.split(/(?<=[。！？；\n])/).map((s) => s.trim()).filter(Boolean)
         const sentences = []
@@ -674,6 +715,7 @@ window.__ModuleLoader__.load({
       const [err, setErr] = React.useState('')
       const [busy, setBusy] = React.useState(false)
       const [recording, setRecording] = React.useState(false)
+      const [heldMods, setHeldMods] = React.useState('')
       const [testText, setTestText] = React.useState('这是测试语音，听听效果怎么样。')
 
       const load = React.useCallback(async () => {
@@ -688,6 +730,52 @@ window.__ModuleLoader__.load({
       }, [service])
 
       React.useEffect(() => { if (open) load() }, [open, load])
+
+      // 录制快捷键：独立成一个 effect，recording 一变就重挂监听。
+      // 之前写在 onClick 里，React 重渲染时容易丢。
+      React.useEffect(() => {
+        if (!recording) return
+        console.log('[voice-in] 进入快捷键录制模式')
+        window.__voiceInRecording = true
+        const grab = (e) => {
+          console.log('[voice-in] 录制中按键:', e.key, 'code=' + e.code, 'mods=' + [e.ctrlKey, e.altKey, e.shiftKey, e.metaKey].join(''))
+          if (e.key === 'Escape') {
+            e.preventDefault(); e.stopPropagation()
+            console.log('[voice-in] 录制取消')
+            window.__voiceInRecording = false
+            setRecording(false)
+            return
+          }
+          const parts = []
+          if (e.ctrlKey) parts.push('Ctrl')
+          if (e.altKey) parts.push('Alt')
+          if (e.shiftKey) parts.push('Shift')
+          if (e.metaKey) parts.push('Meta')
+          const k = e.code === 'Space' ? 'Space' : (e.key || '').length === 1 ? e.key.toUpperCase() : e.key
+          // 纯修饰键先不录，等用户按下主键
+          if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) {
+            const held = []
+            if (e.ctrlKey) held.push('Ctrl')
+            if (e.altKey) held.push('Alt')
+            if (e.shiftKey) held.push('Shift')
+            if (e.metaKey) held.push('Meta')
+            setHeldMods(held.join('+'))
+            return
+          }
+          // 纯字母（无修饰键）不录，避免吃掉正常打字；F 键和 Space 例外
+          if (!parts.length && !/^F\d{1,2}$/.test(k) && k !== 'Space') return
+          e.preventDefault(); e.stopPropagation()
+          parts.push(k)
+          const combo = parts.join('+')
+          console.log('[voice-in] 录到新快捷键:', combo)
+          onHotkeySet(combo)
+          window.__voiceInRecording = false
+          setHeldMods('')
+          setRecording(false)
+        }
+        window.addEventListener('keydown', grab, true)
+        return () => { window.__voiceInRecording = false; window.removeEventListener('keydown', grab, true) }
+      }, [recording, onHotkeySet])
 
       const tryTts = async () => {
         setBusy(true)
@@ -761,34 +849,13 @@ window.__ModuleLoader__.load({
           h('div', { key: 't', style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center' } }, [
             h('span', { key: 'k', style: { color: 'rgba(150,170,195,0.75)' } }, '按住说话'),
             h('span', { key: 'v', style: { color: '#8ec5ff', fontFamily: 'monospace' } },
-              recording ? '按下新组合…' : (hotkey || '（未设置）')),
+              recording
+                ? (heldMods ? heldMods + ' + 请再按一个键' : '按下新组合…')
+                : (hotkey || '（未设置）')),
           ]),
           h('div', { key: 'b', style: { display: 'flex', gap: 6, marginTop: 6 } }, [
-            btn(recording ? '取消' : '改快捷键', () => {
-              if (recording) { setRecording(false); return }
-              setRecording(true)
-              // 用一次性的捕获监听抓下一个组合键
-              const grab = (e) => {
-                e.preventDefault(); e.stopPropagation()
-                if (e.key === 'Escape') {
-                  setRecording(false)
-                  window.removeEventListener('keydown', grab, true)
-                  return
-                }
-                const parts = []
-                if (e.ctrlKey) parts.push('Ctrl')
-                if (e.altKey) parts.push('Alt')
-                if (e.shiftKey) parts.push('Shift')
-                if (e.metaKey) parts.push('Meta')
-                const k = e.code === 'Space' ? 'Space' : (e.key || '').length === 1 ? e.key.toUpperCase() : e.key
-                if (!parts.length && !['Space', 'F1', 'F2', 'F3', 'F4', 'F5', 'F6'].includes(k)) return
-                parts.push(k)
-                onHotkeySet(parts.join('+'))
-                setRecording(false)
-                window.removeEventListener('keydown', grab, true)
-              }
-              window.addEventListener('keydown', grab, true)
-            }, recording ? { background: 'rgba(255,150,80,0.2)' } : null),
+            btn(recording ? '取消' : '改快捷键', () => setRecording((v) => !v),
+              recording ? { background: 'rgba(255,150,80,0.2)' } : null),
             btn('恢复默认', () => onHotkeySet('Ctrl+Shift+Space')),
           ]),
           h('div', { key: 'h', style: { marginTop: 5, fontSize: 10.5, color: 'rgba(130,150,175,0.65)' } },
