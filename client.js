@@ -546,6 +546,17 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      // ⭐ 2026-11-03：关页面 / 切走时把正在播的声音掐掉，别让它挂着继续念
+      React.useEffect(() => {
+        const stop = () => { try { stopPlayback() } catch (e) {} }
+        window.addEventListener('pagehide', stop)
+        window.addEventListener('beforeunload', stop)
+        return () => {
+          window.removeEventListener('pagehide', stop)
+          window.removeEventListener('beforeunload', stop)
+        }
+      }, [stopPlayback])
+
       /** 手动：点一下读最后一条（正在播就停） */
       const readLastAnswer = React.useCallback(() => {
         if (speak === 'playing' || speak === 'loading') {
@@ -676,9 +687,10 @@ window.__ModuleLoader__.load({
             setAuto((v) => {
               const next = !v
               if (!next) {
-                try { audioRef.current?.pause() } catch {}
-                audioRef.current = null
-                setSpeak('idle'); setHint('')
+                // ⭐ 2026-11-03：关自动播报必须走统一的抢占逻辑。
+                //    只 pause 不会让「逐句循环」退出 —— 它会继续 await 下一句接着念，
+                //    用户看到的就是"关掉了还在念"。
+                stopPlayback()
               } else {
                 lastSpokenRef.current = textKey(pickLastAnswer().text)   // 打开时把当前这条记下，别立刻念旧的
                 stableRef.current = { key: '', at: 0 }

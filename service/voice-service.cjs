@@ -230,8 +230,25 @@ function synth(text, outPath, speed) {
     if (!f5.proc) startF5()
     if (!f5.proc) return reject(new Error('TTS 没启动（缺音色配置）'))
     const id = ++f5.seq
-    f5.pending.set(id, { resolve, reject })
-    f5.proc.stdin.write(JSON.stringify({ id, text, out: outPath, speed: speed || 0.85 }) + '\n')
+    // ⭐ 2026-11-03：一句最多等 120 秒。f5 卡住/刚崩的时候，请求不能永远挂着 ——
+    //    前端那个 await 一直不返回，朗读就卡在半路，用户会觉得"关也关不掉"。
+    const timer = setTimeout(() => {
+      if (f5.pending.has(id)) {
+        f5.pending.delete(id)
+        reject(new Error('TTS 超时（120 秒没有结果），f5 可能卡住了'))
+      }
+    }, 120000)
+    f5.pending.set(id, {
+      resolve: (v) => { clearTimeout(timer); resolve(v) },
+      reject: (e) => { clearTimeout(timer); reject(e) },
+    })
+    try {
+      f5.proc.stdin.write(JSON.stringify({ id, text, out: outPath, speed: speed || 0.85 }) + '\n')
+    } catch (e) {
+      clearTimeout(timer)
+      f5.pending.delete(id)
+      reject(e)
+    }
   })
 }
 
