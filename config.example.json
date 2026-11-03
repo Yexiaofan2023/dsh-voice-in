@@ -1,4 +1,4 @@
-﻿{
+{
   "_说明": "所有路径都支持 ~ 展开和 %环境变量%。改完重启 DSH 生效。",
 
   "asrModelsRoot": "~/.dsh/speech-to-text/sensevoice/models",

@@ -465,7 +465,14 @@ window.__ModuleLoader__.load({
           if (/^(19|20)\d{2}$/.test(s)) return s.split('').map((d) => cnDigit[+d]).join('')
           // 带小数点
           if (s.includes('.')) {
-            const [a, b] = s.split('.')
+            const parts = s.split('.')
+            // 三段及以上是版本号（2.5.1）：一段一段读，别连成一坨
+            if (parts.length > 2) {
+              const head = intToCn(parts[0])
+              const rest = parts.slice(1).map((p) => (p.length <= 2 ? intToCn(p) : p.split('').map((d) => cnDigit[+d]).join('')))
+              return head + '点' + rest.join('点')
+            }
+            const [a, b] = parts
             return intToCn(a) + '点' + b.split('').map((d) => cnDigit[+d]).join('')
           }
           return intToCn(s)
@@ -568,8 +575,6 @@ window.__ModuleLoader__.load({
         for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
         return (h >>> 0).toString(36) + ':' + s.length
       }
-      // 自动播报念过的指纹集合：同一条回答只念一次，除非内容真的变了（前缀变了）
-      const autoSpokenRef = React.useRef(new Set())
 
       // 换了会话就把播报状态归零，别把新会话的旧消息当成新回答念一遍。
       // URL 和页面标题一起看——DSH 是单页应用，切会话不一定改 URL，但标题通常跟着变。
