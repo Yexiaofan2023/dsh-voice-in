@@ -558,10 +558,17 @@ window.__ModuleLoader__.load({
       }, [stopPlayback])
 
       // ⭐ 2026-11-03：桌面端关窗口只是缩到托盘（asar 里有 new Tray），页面还在跑，
-      //    音频就会继续播 —— pagehide 根本不触发。这里用 visibility 兜：隐藏满 5 秒就停，
-      //    短暂切窗（alt+tab 去抄点东西）不会被误杀。
+      //    音频就会继续播 —— pagehide 根本不触发。这里用 visibility 兜。
+      // 延迟可配：默认 0 = 一隐藏就停；想留个缓冲就设
+      //   localStorage.setItem('voice-in-hidden-stop-ms', '5000')
       React.useEffect(() => {
         let timer = 0
+        const 延迟 = (() => {
+          try {
+            const v = Number(localStorage.getItem('voice-in-hidden-stop-ms'))
+            return Number.isFinite(v) && v >= 0 ? v : 0
+          } catch (e) { return 0 }
+        })()
         const onVis = () => {
           try {
             if (document.visibilityState === 'hidden') {
@@ -569,7 +576,7 @@ window.__ModuleLoader__.load({
               timer = setTimeout(() => {
                 timer = 0
                 try { stopPlayback() } catch (e) {}
-              }, 5000)
+              }, 延迟)
             } else if (timer) {
               clearTimeout(timer)
               timer = 0
