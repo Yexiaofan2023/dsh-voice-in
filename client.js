@@ -557,6 +557,32 @@ window.__ModuleLoader__.load({
         }
       }, [stopPlayback])
 
+      // ⭐ 2026-11-03：桌面端关窗口只是缩到托盘（asar 里有 new Tray），页面还在跑，
+      //    音频就会继续播 —— pagehide 根本不触发。这里用 visibility 兜：隐藏满 5 秒就停，
+      //    短暂切窗（alt+tab 去抄点东西）不会被误杀。
+      React.useEffect(() => {
+        let timer = 0
+        const onVis = () => {
+          try {
+            if (document.visibilityState === 'hidden') {
+              if (timer) return
+              timer = setTimeout(() => {
+                timer = 0
+                try { stopPlayback() } catch (e) {}
+              }, 5000)
+            } else if (timer) {
+              clearTimeout(timer)
+              timer = 0
+            }
+          } catch (e) {}
+        }
+        document.addEventListener('visibilitychange', onVis)
+        return () => {
+          if (timer) clearTimeout(timer)
+          document.removeEventListener('visibilitychange', onVis)
+        }
+      }, [stopPlayback])
+
       /** 手动：点一下读最后一条（正在播就停） */
       const readLastAnswer = React.useCallback(() => {
         if (speak === 'playing' || speak === 'loading') {
