@@ -10,7 +10,7 @@ const http = require('http')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
-const { spawn } = require('child_process')
+const { spawn, spawnSync } = require('child_process')
 
 const HOME = os.homedir()
 const HOME_DSH = path.join(HOME, '.dsh')
@@ -311,7 +311,45 @@ const server = http.createServer(async (req, res) => {
   send(res, 404, { ok: false, error: 'not found' })
 })
 
+/**
+ * ⭐ 2026-11-03：收尸。f5 是我们 spawn 的孙子进程，宿主重启/service 被杀时
+ *   Windows 不会连带杀掉它 —— 它会继续占着显存，下一次启动再起一个就双份模型。
+ *   taskkill /T 连子树一起砍。
+ */
+function stopF5() {
+  const proc = f5.proc
+  f5.proc = null
+  f5.ready = false
+  if (!proc || !proc.pid) return
+  try {
+    if (process.platform === 'win32') {
+      spawnSync('taskkill', ['/PID', String(proc.pid), '/T', '/F'], { stdio: 'ignore' })
+    } else {
+      proc.kill('SIGKILL')
+    }
+  } catch (e) {
+    try { proc.kill() } catch (e2) {}
+  }
+}
+
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']) {
+  try { process.on(sig, () => { stopF5(); process.exit(0) }) } catch (e) {}
+}
+// exit 里只能跑同步操作 —— taskkill 走 spawnSync 正好合适
+process.on('exit', () => { try { stopF5() } catch (e) {} })
+
 const PORT = Number(process.env.VOICE_PORT || cfg.port) || 7788
+// ⭐ 2026-11-03：端口被占时别静默崩 —— 多半是上次的服务没退干净（孤儿），
+//    这种情况下新服务起不来、旧服务还在跑，两边各起一个 f5 ⇒ 双份模型吃爆显存。
+server.on('error', (e) => {
+  if (e && e.code === 'EADDRINUSE') {
+    console.error('[voice] 端口 ' + PORT + ' 已被占用：多半是上一次的服务没退干净。本进程退出，请先结束占用该端口的进程。')
+    stopF5()
+    process.exit(1)
+  }
+  console.error('[voice] server 出错：', (e && e.message) || e)
+})
+
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`voice service on http://127.0.0.1:${PORT}`)
   const miss = selfCheck()
